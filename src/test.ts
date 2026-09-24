@@ -4,16 +4,16 @@ import * as path from 'path';
 import * as fs from 'fs';
 
 // Now import target files
-import { CScoutClient } from './cscoutClient';
 import { toWslPath, fromWslPath } from './platform';
 import { detectAll } from './buildSystem';
+import { buildTokenMap, chooseLineCandidate, diffRange, pickFunction, TokenMap } from './identity';
+import { CScoutFileTokens, CScoutHoverFunction } from './cscoutClient';
 import { CScoutLifecycle } from './lifecycle';
 import {
     activate,
     CScoutHoverProvider
 } from './extension';
 
-const client = new CScoutClient('localhost', 8081);
 
 
 async function runTests() {
@@ -90,13 +90,16 @@ async function runTests() {
     // --- API Count and Pagination Tests ---
     // --- Mock Provider Unit Tests ---
     await test('Hover Provider respects cancellation', async () => {
-        const hoverProvider = new CScoutHoverProvider(() => client);
+        let resolved = false;
+        const resolver = { resolve: async () => { resolved = true; return undefined; } };
+        const hoverProvider = new CScoutHoverProvider(resolver as any, () => false);
         const doc = new MockDocument({ fsPath: 'awk/awk.c' }, 'void checkdup() {}');
         const pos = new MockPosition(0, 5);
         const token = { isCancellationRequested: true, onCancellationRequested: () => ({ dispose: () => { } }) };
 
         const hover = await hoverProvider.provideHover(doc as any, pos as any, token as any);
         assert(hover === undefined, 'Hover was not cancelled');
+        assert(!resolved, 'Hover looked up the identifier after cancellation');
     });
 
     // --- Original Integration Tests ---
@@ -206,6 +209,181 @@ async function runTests() {
             // Restore setTimeout
             global.setTimeout = originalSetTimeout;
         }
+    });
+
+
+    // --- Identifier identity (token map) ---
+
+    // A file as CScout would record it: tokens gives [byte offset, name]
+    // for every identifier token, and each distinct EID gets an index.
+    function tokensFor(fid: number, tokens: [number, string, number][]): CScoutFileTokens {
+        const eids: number[] = [];
+        const names: string[] = [];
+        const flat: number[] = [];
+        for (const [off, name, eid] of tokens) {
+            let k = eids.indexOf(eid);
+            if (k < 0) { k = eids.length; eids.push(eid); names.push(name); }
+            flat.push(off, k);
+        }
+        return { fid, eids, names, tokens: flat };
+    }
+
+    // Byte offsets of every occurrence of name in text, as CScout records them.
+    function bytesAt(text: string, name: string): number[] {
+        const out: number[] = [];
+        for (let i = text.indexOf(name); i >= 0; i = text.indexOf(name, i + 1)) {
+            out.push(Buffer.byteLength(text.slice(0, i), 'utf8'));
+        }
+        return out;
+    }
+
+    // Look up the whole word containing offset `at`, cursor at `at`.
+    function lookupAt(map: TokenMap, text: string, at: number) {
+        let s = at, e = at;
+        while (s > 0 && /\w/.test(text[s - 1])) s--;
+        while (e < text.length && /\w/.test(text[e])) e++;
+        return map.lookup(s, e, at);
+    }
+
+    const three = 'struct s { int s; } s;\nint x;\n';
+    const threeTokens = tokensFor(1, [[7, 's', 100], [15, 's', 200], [20, 's', 300], [27, 'x', 400]]);
+
+    await test('Token map tells three same-named identifiers on one line apart', async () => {
+        const map = buildTokenMap(threeTokens, Buffer.from(three), three);
+        const got = [7, 15, 20].map((o) => lookupAt(map, three, o));
+        assert(got.every((g) => g.kind === 'exact'), 'expected exact matches');
+        const eids = got.map((g) => (g as any).eid);
+        assert(eids.join() === '100,200,300', `wrong identities: ${eids.join()}`);
+        assert(!map.modified, 'unchanged file reported as modified');
+    });
+
+    await test('Token map reports none for keywords and unrecorded words', async () => {
+        const map = buildTokenMap(threeTokens, Buffer.from(three), three);
+        assert(lookupAt(map, three, 0).kind === 'none', 'keyword "struct" should be none');
+        assert(lookupAt(map, three, 11).kind === 'none', 'keyword "int" should be none');
+    });
+
+    await test('Token map follows an edit above the identifier exactly', async () => {
+        const map = buildTokenMap(threeTokens, Buffer.from(three), three);
+        const inserted = '/* new comment */\n';
+        map.applyChange(0, 0, inserted.length);
+        const now = inserted + three;
+        const g = lookupAt(map, now, inserted.length + 15);
+        assert(g.kind === 'exact' && g.eid === 200, `expected the member s (200), got ${JSON.stringify(g)}`);
+        assert(map.modified, 'edited map should report modified');
+    });
+
+    await test('Token map treats a renamed-in-place token as unknown', async () => {
+        const text = 'int count;\n';
+        const map = buildTokenMap(tokensFor(1, [[4, 'count', 7]]), Buffer.from(text), text);
+        map.applyChange(6, 0, 1);                              // co|unt -> coXunt
+        assert(lookupAt(map, 'int coXunt;\n', 5).kind === 'unknown', 'edit inside a name must not match');
+    });
+
+    await test('Token map keeps a token when a space is typed after it', async () => {
+        const text = 'int count;\n';
+        const map = buildTokenMap(tokensFor(1, [[4, 'count', 7]]), Buffer.from(text), text);
+        map.applyChange(9, 0, 1);                              // "count ;"
+        const g = lookupAt(map, 'int count ;\n', 5);
+        assert(g.kind === 'exact' && g.eid === 7, 'space after a name should keep it exact');
+    });
+
+    await test('Token map treats letters typed onto a name as unknown', async () => {
+        const text = 'int count;\n';
+        const map = buildTokenMap(tokensFor(1, [[4, 'count', 7]]), Buffer.from(text), text);
+        map.applyChange(9, 0, 2);                              // count -> counter
+        assert(lookupAt(map, 'int counter;\n', 5).kind === 'unknown', 'count -> counter must not match count');
+    });
+
+    await test('Token map treats two words joined by a deletion as unknown', async () => {
+        const text = 'a b;\n';
+        const map = buildTokenMap(tokensFor(1, [[0, 'a', 1], [2, 'b', 2]]), Buffer.from(text), text);
+        map.applyChange(1, 1, 0);                              // "a b" -> "ab"
+        assert(lookupAt(map, 'ab;\n', 0).kind === 'unknown', 'joined word must not match a or b');
+    });
+
+    await test('Token map resolves each part of a split identifier', async () => {
+        // CScout records alpha_impl as alpha + _impl when the name is
+        // also built by token pasting (n ## _impl) elsewhere.
+        const text = 'int alpha_impl(void);\n';
+        const map = buildTokenMap(tokensFor(1, [[4, 'alpha', 10], [9, '_impl', 20]]), Buffer.from(text), text);
+        const first = lookupAt(map, text, 6);
+        const second = lookupAt(map, text, 11);
+        assert(first.kind === 'exact' && first.eid === 10 && first.start === 4 && first.end === 9, 'cursor on alpha');
+        assert(second.kind === 'exact' && second.eid === 20 && second.start === 9, 'cursor on _impl');
+    });
+
+    await test('Token map stops trusting a file changed on disk after analysis', async () => {
+        // Analyzed text: "int a; int b;". The file on disk now has a
+        // line inserted between them, so b's recorded offset is wrong.
+        const analyzedTokens = tokensFor(1, [[4, 'a', 1], [11, 'b', 2]]);
+        const disk = 'int a;\nint zz; int b;';
+        const map = buildTokenMap(analyzedTokens, Buffer.from(disk), disk);
+        assert(lookupAt(map, disk, 4).kind === 'exact', 'a is before the change and still exact');
+        assert(lookupAt(map, disk, 15).kind === 'unknown', 'b after the change must be unknown');
+        assert(map.modified, 'changed file should report modified');
+    });
+
+    await test('Token map applies unsaved edits on top of the analyzed file', async () => {
+        const disk = 'int a;\nint b;\n';
+        const unsaved = '// top\nint a;\nint b;\n';
+        const map = buildTokenMap(tokensFor(1, [[4, 'a', 1], [11, 'b', 2]]), Buffer.from(disk), unsaved);
+        const g = lookupAt(map, unsaved, unsaved.indexOf('b'));
+        assert(g.kind === 'exact' && g.eid === 2, 'b should be found at its shifted position');
+    });
+
+    await test('Token map converts byte offsets past CRLF and UTF-8 text', async () => {
+        // "é" is 2 bytes but 1 character; "𝒳" is 4 bytes but 2 UTF-16 units.
+        const text = '// café 𝒳\r\nint value;\r\nint other;\r\n';
+        const t = tokensFor(1, [[bytesAt(text, 'value')[0], 'value', 5], [bytesAt(text, 'other')[0], 'other', 6]]);
+        const map = buildTokenMap(t, Buffer.from(text, 'utf8'), text);
+        const v = lookupAt(map, text, text.indexOf('value'));
+        const o = lookupAt(map, text, text.indexOf('other'));
+        assert(v.kind === 'exact' && v.eid === 5 && v.start === text.indexOf('value'), `value: ${JSON.stringify(v)}`);
+        assert(o.kind === 'exact' && o.eid === 6, 'other');
+        assert(!map.modified, 'unchanged file reported as modified');
+    });
+
+    await test('Token map lists an identifier\'s current occurrences', async () => {
+        const text = 'int n; n = n + 1;\n';
+        const offs = [4, 7, 11];
+        const map = buildTokenMap(tokensFor(1, offs.map((o) => [o, 'n', 9] as [number, string, number])), Buffer.from(text), text);
+        map.applyChange(0, 0, 3);
+        const ranges = map.rangesOf(9).map(([s]) => s).join();
+        assert(ranges === '7,10,14', `shifted ranges wrong: ${ranges}`);
+    });
+
+    await test('diffRange finds the single changed span', async () => {
+        const [at, removed, inserted] = diffRange('int a; int b;', 'int a; long b;');
+        assert(at === 7 && removed === 3 && inserted === 4, `got ${at},${removed},${inserted}`);
+    });
+
+    await test('chooseLineCandidate matches by column only when needed', async () => {
+        const one = chooseLineCandidate([{ EID: 1, COLUMN: 3 }, { EID: 1, COLUMN: 9 }], 99);
+        assert(one?.eid === 1 && !one.byColumn, 'one identifier on the line');
+        const byCol = chooseLineCandidate([{ EID: 1, COLUMN: 7 }, { EID: 2, COLUMN: 15 }], 15);
+        assert(byCol?.eid === 2 && byCol.byColumn, 'pick by column');
+        assert(chooseLineCandidate([{ EID: 1, COLUMN: 7 }, { EID: 2, COLUMN: 15 }], 11) === undefined, 'no guess');
+    });
+
+    function fn(id: number, defFid: number | null, defOff: number | null, fanin: number, ccycl: number): CScoutHoverFunction {
+        return {
+            ID: id, NAME: 'f', ISMACRO: 0, DEFINED: defFid === null ? 0 : 1, FILESCOPED: 0, FANIN: fanin,
+            FANOUT: 0, CCYCL1: ccycl, CCYCL1_PRE: ccycl, DEF_FID: defFid, DEF_FOFFSET: defOff, DEF_FILE: 'f.c', DEF_LNUM: 1,
+        };
+    }
+
+    await test('pickFunction treats per-project copies as one definition', async () => {
+        const pick = pickFunction([fn(1, 5, 100, 123, 3), fn(2, 5, 100, 442, 3)], undefined);
+        assert(pick.kind === 'one' && pick.fn.ID === 2, 'expected one definition, the record with most callers');
+    });
+
+    await test('pickFunction prefers the definition in the current file, else declines', async () => {
+        const defs = [fn(1, 5, 100, 1, 2), fn(2, 6, 40, 1, 7)];
+        const here = pickFunction(defs, 6);
+        assert(here.kind === 'one' && here.fn.ID === 2, 'definition in the current file');
+        assert(pickFunction(defs, 9).kind === 'ambiguous', 'no definition here: ambiguous, not a guess');
+        assert(pickFunction([fn(3, null, null, 0, 0)], 5).kind === 'none', 'declared only');
     });
 
     // --- Summary ---

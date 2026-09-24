@@ -25,6 +25,8 @@ import {
     CScoutClient,
     CScoutFile,
     CScoutFunction,
+    CScoutHoverData,
+    CScoutHoverFunction,
     CScoutIdentifier,
     CScoutIdentifierClassStat,
     CScoutLocation,
@@ -32,6 +34,8 @@ import {
     FunctionFilters,
 } from './cscoutClient';
 import { CScoutLifecycle, CScoutState } from './lifecycle';
+import { IdentifierResolver, Resolution } from './identifierResolver';
+import { pickFunction } from './identity';
 import { CScoutSettings } from './buildSystem';
 import { toEditorPath, toCScoutPath, checkDependency, commandRunsInWsl } from './platform';
 
@@ -833,156 +837,8 @@ function iconForId(id: CScoutIdentifier): vscode.ThemeIcon {
 }
 
 
-async function resolveLnum(client: CScoutClient, fileOrFid: string | number, foffset: number): Promise<number | null> {
-    try {
-        let filePath: string | undefined;
-        if (typeof fileOrFid === 'string') {
-            filePath = fileOrFid;
-        } else {
-            const files = await client.getFiles();
-            const file = files.find(f => f.FID === fileOrFid);
-            filePath = file?.NAME;
-        }
-        if (!filePath) return null;
-        const uri = vscode.Uri.file(toEditorPath(filePath));
-        const doc = await vscode.workspace.openTextDocument(uri);
-        return doc.positionAt(foffset).line + 1;
-    } catch {
-        return null;
-    }
-}
-
-async function resolveExactIdentifierAtCursor(
-    client: CScoutClient,
-    document: vscode.TextDocument,
-    position: vscode.Position,
-    name: string,
-    token?: vscode.CancellationToken
-): Promise<CScoutIdentifier | undefined> {
-    if (token?.isCancellationRequested) return undefined;
-
-    const targetLine = position.line + 1;
-    const targetFsPath = document.uri.fsPath;
-
-    try {
-        // Attempt exact EID resolution using CScout's token database.
-        const exactMatch = await client.resolveIdentifier(name, targetFsPath, targetLine);
-        if (exactMatch) {
-            return exactMatch;
-        }
-    } catch (e) {
-        if (e instanceof Error && e.message.includes('HTTP 404')) {
-            // Ignore 404s and fallback if the exact token lookup fails
-        } else {
-            throw e;
-        }
-    }
-
-    // TODO: this fallback exists because CScout resolves by file and exact
-    // line number from whenever analysis last ran. If the file is edited
-    // afterward and the identifier's line shifts, the old line number no
-    // longer matches anything and the lookup 404s even though the
-    // identifier itself is unchanged. Once the line can't be trusted, name
-    // is the only thing left to search by, so this falls back to asking if
-    // anything with this exact name exists anywhere in the project.
-    //
-    // TODO: the limit: 1000 below is just a safety cap, not a real fix.
-    // The server's name filter isn't an exact match, so a short common
-    // name (like "len") can come back with close to 1000 rows that mostly
-    // get discarded by the .filter() below. The real fix is teaching
-    // csapi.py to do the exact match itself, or to only search inside the
-    // current file, instead of fetching a pile of data just to throw most
-    // of it away.
-    const results = await client.getIdentifiers({ name, limit: 1000 });
-    const matching = results.filter((r) => r.NAME === name);
-
-    if (matching.length === 0) return undefined;
-    if (matching.length === 1) return matching[0];
-
-    const targetFsPathLower = targetFsPath.toLowerCase();
-
-    let fileMatch: CScoutIdentifier | undefined;
-
-    for (const r of matching) {
-        if (token?.isCancellationRequested) return undefined;
-        const detail = await client.getIdentifier(r.EID).catch(() => null);
-        if (detail) {
-            for (const loc of detail.locations) {
-                const locFsPath = vscode.Uri.file(toEditorPath(loc.FILE)).fsPath.toLowerCase();
-                if (locFsPath === targetFsPathLower) {
-                    if (loc.LNUM === targetLine) {
-                        return r; // exact match
-                    }
-                    if (!fileMatch) {
-                        fileMatch = r; // save first match in same file as fallback
-                    }
-                }
-            }
-        }
-    }
-    return fileMatch || matching[0]; // fallback to same file, then any match
-}
-
-// Scans the whole file from the start, character by character, to figure out
-// if position is inside a comment or a string literal. Runs on every hover,
-// definition, reference, and rename, so it re-scans the whole file each time
-// it's called, not just once per file.
-function isInsideCommentOrString(document: vscode.TextDocument, position: vscode.Position): boolean {
-    const text = document.getText();
-    const offset = document.offsetAt(position);
-
-    let inString = false;
-    let stringChar = '';
-    let inChar = false;
-    let inLineComment = false;
-    let inBlockComment = false;
-
-    for (let i = 0; i < offset; i++) {
-        const char = text[i];
-        const nextChar = text[i + 1] || '';
-
-        if (inLineComment) {
-            if (char === '\n') {
-                inLineComment = false;
-            }
-        } else if (inBlockComment) {
-            if (char === '*' && nextChar === '/') {
-                inBlockComment = false;
-                i++; // skip /
-            }
-        } else if (inString) {
-            if (char === '\\') {
-                i++; // skip escaped char
-            } else if (char === stringChar) {
-                inString = false;
-            }
-        } else if (inChar) {
-            if (char === '\\') {
-                i++; // skip escaped char
-            } else if (char === "'") {
-                inChar = false;
-            }
-        } else {
-            if (char === '/' && nextChar === '/') {
-                inLineComment = true;
-                i++;
-            } else if (char === '/' && nextChar === '*') {
-                inBlockComment = true;
-                i++;
-            } else if (char === '"') {
-                inString = true;
-                stringChar = '"';
-            } else if (char === "'") {
-                inChar = true;
-            }
-        }
-    }
-
-    return inLineComment || inBlockComment || inString || inChar;
-}
-
 // -----------------------------------------------------------------------
-// Editor providers: hover, definition, references, CodeLens
+// Editor providers: hover, definition, references, rename
 // -----------------------------------------------------------------------
 
 // Waits ms milliseconds, but returns early (with true) the moment the token
@@ -1004,165 +860,192 @@ async function delayUntilCancelled(ms: number, token: vscode.CancellationToken):
     });
 }
 
+// Says why a hover is a best match rather than a confirmed one.
+function fallbackNote(res: Extract<Resolution, { kind: 'uncertain' }>): string {
+    const how = res.via === 'unique-name'
+        ? 'it is the only identifier with this name'
+        : res.via === 'line-column'
+            ? 'it has this name at this column of the analyzed line'
+            : 'it has this name on the analyzed line';
+    const why = res.why === 'edited'
+        ? 'this part of the file changed since the last analysis'
+        : res.why === 'not-analyzed'
+            ? 'this file was not part of the last analysis'
+            : 'identifier positions for this file could not be loaded';
+    return `$(warning) **Possibly a different identifier:** matched because ${how}, since ${why}. Re-analyze to be sure.`;
+}
+
+// The message shown when rename is refused because the match isn't exact.
+function renameRefusal(res: Resolution): string {
+    return res.kind === 'uncertain' && res.why !== 'edited'
+        ? `CScout can't rename '${res.name}' safely: it can't confirm which identifier this is. Re-analyze first.`
+        : `CScout can't rename '${res.name}' safely: this part of the file changed since the last analysis. Re-analyze first.`;
+}
+
 export class CScoutHoverProvider implements vscode.HoverProvider {
-    constructor(private getClient: () => CScoutClient | undefined) { }
+    constructor(
+        private resolver: IdentifierResolver,
+        private isAnalysisStale: () => boolean
+    ) { }
 
     /**
-     * Provide hover information for a C/C++ identifier.
+     * Hover for a C identifier.
      *
-     * Performance notes:
-     * - Waits 150ms before doing any work, so fast mouse movement across
-     *   the file does not fire a request for every word it passes over.
-     * - Uses CancellationToken to bail out if the user has moved away.
-     * - Uses getFunctionByName() to fetch just this one function's complexity,
-     *   instead of the whole function list.
-     * - Does NOT store any global state, each hover is self-contained.
+     * The resolver matches the position to exactly one identifier (EID),
+     * and everything shown is fetched by that EID in a single request,
+     * cached per EID. Nothing is looked up by name after the match.
+     * Waits 150ms first so sweeping the mouse across the code doesn't
+     * fetch data for every word it crosses.
      */
     async provideHover(
         document: vscode.TextDocument,
         position: vscode.Position,
         token: vscode.CancellationToken
     ): Promise<vscode.Hover | undefined> {
+        if (await delayUntilCancelled(150, token)) return undefined;
+        let res: Resolution | undefined;
+        try {
+            res = await this.resolver.resolve(document, position, token);
+        } catch {
+            return undefined;
+        }
+        if (!res || token.isCancellationRequested) return undefined;
+
+        const md = new vscode.MarkdownString(undefined, true);
+        if (res.kind === 'unmatched') {
+            md.appendMarkdown(`$(warning) **${res.name}** could not be matched to the last CScout analysis: this part of the file changed since it ran. Re-analyze to see its details.`);
+            return new vscode.Hover(md, res.range);
+        }
+
+        let data: CScoutHoverData;
+        try {
+            data = await this.resolver.getHoverData(res.eid);
+        } catch {
+            return undefined;
+        }
         if (token.isCancellationRequested) return undefined;
-        if (isInsideCommentOrString(document, position)) return;
+        const id = data.identifier;
+        md.isTrusted = true;
+
+        md.appendMarkdown(`### $(symbol-${id.FUN ? 'function' : id.MACRO ? 'constant' : 'variable'}) ${id.NAME}\n\n`);
+        md.appendMarkdown(`**Kind:** ${describeIdKind(id).join(', ')}  \n`);
+
+        const scope = id.LSCOPE ? 'Project scope' : id.CSCOPE ? 'File scope' : 'Local';
+        md.appendMarkdown(`**Scope:** ${scope}  \n`);
+
+        // The function whose whole name is this identifier, chosen by
+        // definition (see pickFunction), never by name.
+        const pick = id.FUN ? pickFunction(data.functions, res.fid) : undefined;
+        if (pick?.kind === 'one' && pick.fn.CCYCL1 !== null) {
+            md.appendMarkdown(`**Cyclomatic complexity:** ${pick.fn.CCYCL1_PRE ?? '?'} (Pre-CPP), ${pick.fn.CCYCL1} (Post-CPP)  \n`);
+        } else if (pick?.kind === 'ambiguous') {
+            md.appendMarkdown(`**Defined in ${pick.definitions.length} places**, so no single complexity applies  \n`);
+        }
+
+        const crossesFileBoundary = data.file_count > 1;
+        if (crossesFileBoundary) {
+            md.appendMarkdown(`**Crosses file boundaries** (${data.file_count} files)  \n`);
+        }
+
+        if (id.LSCOPE && !id.CSCOPE && !id.READONLY && !id.UNUSED && !crossesFileBoundary && id.NAME !== 'main') {
+            md.appendMarkdown(`\n💡 **Should be static** - only accessed within a single file  \n`);
+        }
+
+        if (id.UNUSED && !id.READONLY) md.appendMarkdown(`\n⚠ **Unused** - whole-program analysis  \n`);
+        if (id.READONLY) md.appendMarkdown(`🔒 Read-only  \n`);
+
+        if (res.kind === 'uncertain') {
+            md.appendMarkdown(`\n${fallbackNote(res)}  \n`);
+        } else if (res.modified || this.isAnalysisStale()) {
+            md.appendMarkdown(`\n$(info) Source files changed since the last analysis, so these details may be out of date.  \n`);
+        }
+
+        const links = [
+            `[Inspect](command:cscout.inspect?${encodeURIComponent(JSON.stringify([id.EID]))})`,
+            `[Find References](command:cscout.findReferences?${encodeURIComponent(JSON.stringify([id.EID]))})`,
+        ];
+        if (res.kind === 'exact') {
+            links.push(`[Rename](command:cscout.rename?${encodeURIComponent(JSON.stringify([{ line: res.range.start.line, character: res.range.start.character }]))})`);
+        }
+        if (id.FUN) {
+            // A known function goes straight to its graph; otherwise
+            // showCallGraph asks which definition to use.
+            const graphArgs = pick?.kind === 'one' ? [pick.fn.ID, true, id.NAME] : [id.EID];
+            links.push(`[Call Graph](command:cscout.showCallGraph?${encodeURIComponent(JSON.stringify(graphArgs))})`);
+        }
+        md.appendMarkdown(`\n---\n${links.join(' | ')}`);
+
+        return new vscode.Hover(md, res.range);
+    }
+}
+
+class CScoutDefinitionProvider implements vscode.DefinitionProvider {
+    constructor(private getClient: () => CScoutClient | undefined, private resolver: IdentifierResolver) { }
+
+    async provideDefinition(
+        document: vscode.TextDocument,
+        position: vscode.Position,
+        token: vscode.CancellationToken
+    ): Promise<vscode.Location[] | undefined> {
         const client = this.getClient();
         if (!client) return;
-        const range = document.getWordRangeAtPosition(position, /[A-Za-z_][A-Za-z0-9_]*/);
-        if (!range) return;
-        const name = document.getText(range);
-
-        if (await delayUntilCancelled(150, token)) return undefined;
         try {
-            const exact = await resolveExactIdentifierAtCursor(client, document, position, name, token);
-            if (token.isCancellationRequested || !exact) return;
-            const md = new vscode.MarkdownString(undefined, true);
-            md.isTrusted = true;
+            const res = await this.resolver.resolve(document, position, token);
+            if (!res || res.kind === 'unmatched' || token.isCancellationRequested) return;
 
-            md.appendMarkdown(`### $(symbol-${exact.FUN ? 'function' : exact.MACRO ? 'constant' : 'variable'}) ${exact.NAME}\n\n`);
-            md.appendMarkdown(`**Kind:** ${describeIdKind(exact)}  \n`);
-
-            const scope = exact.LSCOPE ? 'Project scope' : exact.CSCOPE ? 'File scope' : 'Local';
-            md.appendMarkdown(`**Scope:** ${scope}  \n`);
-
-            // For functions: fetch complexity for this one function only, not the whole function list.
-            if (exact.FUN) {
-                try {
-                    const fn = await client.getFunctionByName(name);
-                    if (token.isCancellationRequested) return;
-                    if (fn && fn.CCYCL1 !== null) {
-                        md.appendMarkdown(`**Cyclomatic complexity:** ${fn.CCYCL1_PRE ?? '?'} (Pre-CPP), ${fn.CCYCL1} (Post-CPP)  \n`);
-                    }
-                } catch { /* skip - metric is optional */ }
-            }
-
-            let crossesFileBoundary = false;
-            const detail = await client.getIdentifier(exact.EID).catch(() => null);
+            // For functions, the definition of the function whose whole
+            // name is this identifier; several if there are unrelated
+            // same-named definitions and none is in this file.
+            const data = await this.resolver.getHoverData(res.eid);
             if (token.isCancellationRequested) return;
-            if (detail && detail.locations.length > 0) {
-                const files = new Set(detail.locations.map(l => l.FID));
-                if (files.size > 1) {
-                    crossesFileBoundary = true;
-                    md.appendMarkdown(`**Crosses file boundaries** (${files.size} files)  \n`);
-                }
+            if (data.identifier.FUN) {
+                const pick = pickFunction(data.functions, res.fid);
+                const defs = pick.kind === 'one' ? [pick.fn] : pick.kind === 'ambiguous' ? pick.definitions : [];
+                const locations = defs
+                    .filter((f) => f.DEF_FILE && f.DEF_LNUM)
+                    .map((f) => new vscode.Location(
+                        vscode.Uri.file(toEditorPath(f.DEF_FILE as string)),
+                        new vscode.Position((f.DEF_LNUM as number) - 1, 0)
+                    ));
+                if (locations.length > 0) return locations;
             }
-
-            if (exact.LSCOPE && !exact.CSCOPE && !exact.READONLY && !exact.UNUSED && !crossesFileBoundary && exact.NAME !== 'main' && detail) {
-                md.appendMarkdown(`\n💡 **Should be static** - only accessed within a single file  \n`);
-            }
-
-            if (exact.UNUSED && !exact.READONLY) md.appendMarkdown(`\n⚠ **Unused** - whole-program analysis  \n`);
-            if (exact.READONLY) md.appendMarkdown(`🔒 Read-only  \n`);
-
-            md.appendMarkdown(`\n---\n`);
-            md.appendMarkdown(`[Inspect](command:cscout.inspect?${encodeURIComponent(JSON.stringify([exact.EID]))}) | `);
-            md.appendMarkdown(`[Find References](command:cscout.findReferences?${encodeURIComponent(JSON.stringify([exact.EID]))}) | `);
-            md.appendMarkdown(`[Rename](command:cscout.rename?${encodeURIComponent(JSON.stringify([{ line: range.start.line, character: range.start.character }]))}) | `);
-            md.appendMarkdown(`[Call Graph](command:cscout.showCallGraph?${encodeURIComponent(JSON.stringify([exact.EID]))})`);
-
-            return new vscode.Hover(md, range);
+            // Other identifiers: the first location in a writable file.
+            // Ask for up to 999999 locations so the real definition doesn't get cut off
+            // if it's far down the list. Not real pagination, just a limit big enough
+            // to cover every project we've seen.
+            //
+            // TODO: this needs a real fix later: either getIdentifier gets
+            // real paging instead of one big number, or the server tells us
+            // straight up how many locations there are instead of us
+            // guessing a limit that's "big enough."
+            const detail = await client.getIdentifier(res.eid, 999999);
+            if (token.isCancellationRequested) return;
+            const located = detail.locations.filter((l) => l.LNUM !== null);
+            const defLoc = located.find((l) => !l.RO) ?? located[0];
+            return defLoc ? [locationToVSCode(defLoc)] : undefined;
         } catch {
             return;
         }
     }
 }
 
-class CScoutDefinitionProvider implements vscode.DefinitionProvider {
-    constructor(private getClient: () => CScoutClient | undefined) { }
-
-    async provideDefinition(document: vscode.TextDocument, position: vscode.Position): Promise<vscode.Location[] | undefined> {
-        if (isInsideCommentOrString(document, position)) return;
-        const client = this.getClient();
-        if (!client) return;
-        const range = document.getWordRangeAtPosition(position, /[A-Za-z_][A-Za-z0-9_]*/);
-        if (!range) return;
-        const name = document.getText(range);
-        try {
-            const exact = await resolveExactIdentifierAtCursor(client, document, position, name);
-            if (!exact) return;
-            const files = await client.getFiles().catch(() => []);
-            const roMap = new Map(files.map(f => [f.FID, f.RO]));
-            const isWritable = (l: CScoutLocation) => {
-                if (l.RO !== undefined) return !l.RO;
-                const ro = roMap.get(l.FID);
-                return ro !== undefined ? !ro : true;
-            };
-
-            // For functions use the definition location from FUNCTIONDEFS.
-            // For other identifiers use the first writable location.
-            if (exact.FUN) {
-                const fullDetail = await client.getIdentifierDetail(exact.EID);
-                if (fullDetail.function_detail?.definition) {
-                    const def = fullDetail.function_detail.definition;
-                    const lnum = await resolveLnum(client, def.FILE, def.FOFFSETBEGIN);
-                    const loc = new vscode.Location(
-                        vscode.Uri.file(toEditorPath(def.FILE)),
-                        new vscode.Position(Math.max(0, (lnum || 1) - 1), 0)
-                    );
-                    return [loc];
-                }
-            }
-            // Non-function: first non-readonly location.
-            // Ask for up to 999999 locations so the real definition doesn't get cut off
-            // if it's far down the list. Not real pagination, just a limit big enough
-            // to cover every project we've seen.
-            //
-            // TODO: same kind of workaround as the limit: 1000 fallback in
-            // resolveExactIdentifierAtCursor above. This needs a real fix later too:
-            // either getIdentifier gets real paging instead of one big number, or the
-            // server tells us straight up how many locations there are instead of us
-            // guessing a limit that's "big enough."
-            const detail = await client.getIdentifier(exact.EID, 999999);
-            const defLoc = detail.locations.find((l) => l.LNUM !== null && isWritable(l));
-            if (defLoc) {
-                return [locationToVSCode(defLoc)];
-            }
-            const anyLoc = detail.locations.find((l) => l.LNUM !== null);
-            if (anyLoc) {
-                return [locationToVSCode(anyLoc)];
-            }
-            return;
-        } catch (err) {
-            return;
-        }
-    }
-}
-
 class CScoutReferenceProvider implements vscode.ReferenceProvider {
-    constructor(private getClient: () => CScoutClient | undefined) { }
+    constructor(private getClient: () => CScoutClient | undefined, private resolver: IdentifierResolver) { }
 
-    async provideReferences(document: vscode.TextDocument, position: vscode.Position): Promise<vscode.Location[] | undefined> {
-        if (isInsideCommentOrString(document, position)) return;
+    async provideReferences(
+        document: vscode.TextDocument,
+        position: vscode.Position,
+        _context: vscode.ReferenceContext,
+        token: vscode.CancellationToken
+    ): Promise<vscode.Location[] | undefined> {
         const client = this.getClient();
         if (!client) return;
-        const range = document.getWordRangeAtPosition(position, /[A-Za-z_][A-Za-z0-9_]*/);
-        if (!range) return;
-        const name = document.getText(range);
         try {
-            const exact = await resolveExactIdentifierAtCursor(client, document, position, name);
-            if (!exact) return;
+            const res = await this.resolver.resolve(document, position, token);
+            if (!res || res.kind === 'unmatched' || token.isCancellationRequested) return;
             // Same 999999 workaround as the definition lookup above, so Find All
             // References doesn't miss anything either.
-            const detail = await client.getIdentifier(exact.EID, 999999);
+            const detail = await client.getIdentifier(res.eid, 999999);
             return detail.locations.filter((l) => l.LNUM !== null).map(locationToVSCode);
         } catch {
             return;
@@ -1171,102 +1054,126 @@ class CScoutReferenceProvider implements vscode.ReferenceProvider {
 }
 
 class CScoutRenameProvider implements vscode.RenameProvider {
-    constructor(private getClient: () => CScoutClient | undefined, private channel: vscode.OutputChannel) { }
+    constructor(
+        private getClient: () => CScoutClient | undefined,
+        private resolver: IdentifierResolver,
+        private channel: vscode.OutputChannel
+    ) { }
 
-    async prepareRename(document: vscode.TextDocument, position: vscode.Position): Promise<vscode.Range | undefined> {
-        if (isInsideCommentOrString(document, position)) return;
-        return document.getWordRangeAtPosition(position, /[A-Za-z0-9_]+/) || document.getWordRangeAtPosition(position);
+    /*
+     * Rename edits code, so it needs an exact match: an identifier
+     * matched only by name could be a different one. Returning undefined
+     * leaves the position to other rename providers; throwing tells VS
+     * Code why CScout declined.
+     */
+    async prepareRename(
+        document: vscode.TextDocument,
+        position: vscode.Position,
+        token: vscode.CancellationToken
+    ): Promise<vscode.Range | undefined> {
+        const res = await this.resolver.resolve(document, position, token);
+        if (!res) return undefined;
+        if (res.kind !== 'exact') {
+            throw new Error(renameRefusal(res));
+        }
+        return res.range;
     }
 
     async provideRenameEdits(
         document: vscode.TextDocument,
         position: vscode.Position,
-        newName: string
+        newName: string,
+        token: vscode.CancellationToken
     ): Promise<vscode.WorkspaceEdit | undefined> {
-        if (isInsideCommentOrString(document, position)) return;
         const client = this.getClient();
         if (!client) return;
-        const range = document.getWordRangeAtPosition(position, /[A-Za-z0-9_]+/) || document.getWordRangeAtPosition(position);
-        if (!range) return;
-        const oldName = document.getText(range);
+        const res = await this.resolver.resolve(document, position, token);
+        if (!res) return;
+        if (res.kind !== 'exact') {
+            vscode.window.showErrorMessage(renameRefusal(res));
+            return;
+        }
+        const oldName = res.name;
 
         try {
-            const exact = await resolveExactIdentifierAtCursor(client, document, position, oldName);
-            if (!exact) {
-                vscode.window.showErrorMessage(`CScout: could not find '${oldName}' in the analysis database. Try re-running analysis.`);
-                return;
-            }
-
-            const preview = await client.previewRename(exact.EID, newName);
+            const preview = await client.previewRename(res.eid, newName);
             if (!preview.locations || preview.locations.length === 0) {
                 vscode.window.showErrorMessage(`CScout: no occurrences of '${oldName}' found to rename.`);
                 return;
             }
 
+            const byFile = new Map<string, CScoutLocation[]>();
+            for (const loc of preview.locations) {
+                const list = byFile.get(loc.FILE) ?? [];
+                list.push(loc);
+                byFile.set(loc.FILE, list);
+            }
+
             let skippedCount = 0;
             const edit = new vscode.WorkspaceEdit();
-            for (const loc of preview.locations) {
-                if (loc.LNUM === null) {
-                    skippedCount++;
-                    continue;
-                }
-
-                // Fix Windows URI casing mismatch
-                let uri = vscode.Uri.file(toEditorPath(loc.FILE));
+            for (const [file, locs] of byFile) {
+                // Fix Windows URI casing mismatch: use the open document's URI.
+                let uri = vscode.Uri.file(toEditorPath(file));
                 const lowerFsPath = uri.fsPath.toLowerCase();
-                if (document.uri.fsPath.toLowerCase() === lowerFsPath) {
-                    uri = document.uri; // Use the exact same URI as the open document
-                } else {
-                    for (const doc of vscode.workspace.textDocuments) {
-                        if (doc.uri.fsPath.toLowerCase() === lowerFsPath) {
-                            uri = doc.uri;
-                            break;
-                        }
-                    }
+                const openDoc = document.uri.fsPath.toLowerCase() === lowerFsPath
+                    ? document
+                    : vscode.workspace.textDocuments.find((d) => d.uri.fsPath.toLowerCase() === lowerFsPath);
+                if (openDoc) {
+                    uri = openDoc.uri;
                 }
 
-
-                // Fix: CScout runs on WSL/Linux and counts \r\n as 2 bytes.
-                // VS Code on Windows normalizes to \n-only, so positionAt()
-                // expects an offset that doesn't count \r chars.
-                // For a token on LNUM (1-based), there are (LNUM-1) \r bytes
-                // that CScout counted but VS Code doesn't, so subtract them.
-                try {
-                    const openDoc = document.uri.fsPath.toLowerCase() === uri.fsPath.toLowerCase()
-                        ? document
-                        : await vscode.workspace.openTextDocument(uri);
-
-                    const crlfAdjust = openDoc.eol === vscode.EndOfLine.CRLF ? (loc.LNUM - 1) : 0;
-                    const adjustedOffset = loc.FOFFSET - crlfAdjust;
-                    const posFromOffset = openDoc.positionAt(adjustedOffset);
-                    const textAtOffset = openDoc.getText(new vscode.Range(posFromOffset, posFromOffset.translate(0, oldName.length)));
-
-                    const line0 = Math.max(0, loc.LNUM - 1);
-                    let char: number;
-                    if (textAtOffset === oldName) {
-                        char = posFromOffset.character;
-                    } else {
-                        // Fallback: scan the line for the name
-                        const lineText = openDoc.lineAt(line0).text;
-                        char = lineText.indexOf(oldName);
-                        if (char < 0) {
-                            this.channel.appendLine(`Cannot locate '${oldName}' on line ${loc.LNUM}: positionAt gave '${textAtOffset}', line='${lineText.trim()}'`);
-                            skippedCount++;
-                            continue;
-                        }
+                // A document with a token map knows where every occurrence
+                // is now, even after edits. If some occurrences sit in text
+                // changed since analysis, the map has lost them and renaming
+                // the rest would leave the code half renamed.
+                const mapped = openDoc ? this.resolver.mappedOccurrences(openDoc, res.eid) : undefined;
+                if (mapped) {
+                    if (mapped.length < locs.length) {
+                        vscode.window.showErrorMessage(
+                            `CScout: ${locs.length - mapped.length} occurrence(s) of '${oldName}' in ${path.basename(uri.fsPath)} are in text changed since the last analysis. Re-analyze before renaming.`
+                        );
+                        return;
                     }
-
-                    const locRange = new vscode.Range(line0, char, line0, char + oldName.length);
-                    edit.replace(uri, locRange, newName);
-                } catch (e) {
-                    this.channel.appendLine(`Error processing loc: ${friendlyErrorMessage(e)}`);
-                    skippedCount++;
+                    for (const range of mapped) {
+                        edit.replace(uri, range, newName);
+                    }
                     continue;
                 }
 
+                // No map: use the analyzed offset, but only where the text
+                // there is still the old name. Anything else is skipped
+                // and reported rather than guessed.
+                let doc: vscode.TextDocument;
+                try {
+                    doc = openDoc ?? await vscode.workspace.openTextDocument(uri);
+                } catch (e) {
+                    this.channel.appendLine(`Cannot open ${file} to rename: ${friendlyErrorMessage(e)}`);
+                    skippedCount += locs.length;
+                    continue;
+                }
+                for (const loc of locs) {
+                    if (loc.LNUM === null) {
+                        skippedCount++;
+                        continue;
+                    }
+                    // CScout counts \r\n as 2 bytes. VS Code on Windows
+                    // normalizes to \n-only, so positionAt() expects an offset
+                    // that doesn't count \r chars. For a token on LNUM (1-based)
+                    // there are (LNUM-1) \r bytes to subtract.
+                    const crlfAdjust = doc.eol === vscode.EndOfLine.CRLF ? (loc.LNUM - 1) : 0;
+                    const start = doc.positionAt(loc.FOFFSET - crlfAdjust);
+                    const range = new vscode.Range(start, start.translate(0, oldName.length));
+                    const found = doc.getText(range);
+                    if (found !== oldName) {
+                        this.channel.appendLine(`Skipped '${oldName}' at ${file}:${loc.LNUM}: the text there is now '${found}'.`);
+                        skippedCount++;
+                        continue;
+                    }
+                    edit.replace(uri, range, newName);
+                }
             }
             if (edit.size === 0) {
-                const msg = skippedCount > 0 
+                const msg = skippedCount > 0
                     ? `CScout: found occurrences of '${oldName}' but couldn't safely edit any of them (${skippedCount} skipped). See the CScout output channel for details.`
                     : `CScout: no occurrences of '${oldName}' found to rename.`;
                 vscode.window.showErrorMessage(msg);
@@ -1514,9 +1421,17 @@ export function activate(context: vscode.ExtensionContext): void {
     const diagnostics = vscode.languages.createDiagnosticCollection('cscout');
     context.subscriptions.push(diagnostics);
 
+    // Maps editor positions to identifiers for hover, navigation and
+    // rename. Created before the lifecycle because every state change
+    // below resets it.
+    const resolver = new IdentifierResolver(() => lifecycle.getClient(), channel);
+    context.subscriptions.push(resolver);
+
     const lifecycle = new CScoutLifecycle(settings, channel, {
         onStateChange: (state, detail) => {
             currentState = state;
+            // Any transition means a different analysis, or none.
+            resolver.reset();
             void vscode.commands.executeCommand('setContext', stateContextKey, state);
             if (state !== 'ready') {
                 isAnalysisStale = false;
@@ -1538,6 +1453,11 @@ export function activate(context: vscode.ExtensionContext): void {
                 const client = lifecycle.getClient();
                 if (client) {
                     void refreshDiagnostics(client, diagnostics);
+                }
+                // Load token positions for the files already on screen, so
+                // the first hover doesn't wait for them.
+                for (const editor of vscode.window.visibleTextEditors) {
+                    resolver.prefetch(editor.document);
                 }
             } else {
                 diagnostics.clear();
@@ -1638,19 +1558,19 @@ export function activate(context: vscode.ExtensionContext): void {
     context.subscriptions.push(
         vscode.languages.registerHoverProvider(
             selector,
-            new CScoutHoverProvider(clientAccessor)
+            new CScoutHoverProvider(resolver, () => isAnalysisStale)
         ),
         vscode.languages.registerDefinitionProvider(
             selector,
-            new CScoutDefinitionProvider(clientAccessor)
+            new CScoutDefinitionProvider(clientAccessor, resolver)
         ),
         vscode.languages.registerReferenceProvider(
             selector,
-            new CScoutReferenceProvider(clientAccessor)
+            new CScoutReferenceProvider(clientAccessor, resolver)
         ),
         vscode.languages.registerRenameProvider(
             selector,
-            new CScoutRenameProvider(clientAccessor, channel)
+            new CScoutRenameProvider(clientAccessor, resolver, channel)
         ),
         vscode.languages.registerCodeLensProvider(
             selector,
@@ -2166,10 +2086,28 @@ async function showCallGraph(
         fnid = eidOrFnid;
         fnName = nameHint ?? `function ${fnid}`;
     } else {
-        // Called from hover with EID, look up function by name.
-        const detail = await client.getIdentifier(eidOrFnid);
-        fnName = detail.identifier.NAME;
-        const fn = await client.getFunctionByName(fnName);
+        // Called with an EID: find the function whose whole name is this
+        // identifier. If unrelated same-named functions are defined in
+        // several places, ask which one.
+        const data = await client.getIdentifierHover(eidOrFnid);
+        fnName = data.identifier.NAME;
+        const pick = pickFunction(data.functions, undefined);
+        let fn: CScoutHoverFunction | undefined;
+        if (pick.kind === 'one') {
+            fn = pick.fn;
+        } else if (pick.kind === 'ambiguous') {
+            const chosen = await vscode.window.showQuickPick(
+                pick.definitions.map((f) => ({
+                    label: fnName,
+                    description: `${path.basename(toEditorPath(f.DEF_FILE ?? ''))}:${f.DEF_LNUM ?? '?'}`,
+                    detail: f.DEF_FILE ? toEditorPath(f.DEF_FILE) : undefined,
+                    fn: f,
+                })),
+                { title: `${fnName} is defined in ${pick.definitions.length} places` }
+            );
+            if (!chosen) return;
+            fn = chosen.fn;
+        }
         if (!fn) {
             const p = vscode.window.createWebviewPanel(
                 'cscoutCallGraph',

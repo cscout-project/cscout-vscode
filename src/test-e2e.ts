@@ -7,6 +7,7 @@ import * as fs from 'fs';
 // Now import target files
 import { CScoutClient } from './cscoutClient';
 import { toEditorPath } from './platform';
+import { IdentifierResolver } from './identifierResolver';
 import {
     CScoutHoverProvider,
     CScoutCodeLensProvider,
@@ -86,7 +87,8 @@ async function runTests() {
 
     // --- Mock Provider Unit Tests ---
     await test('Hover Provider returns function complexity', async () => {
-        const hoverProvider = new CScoutHoverProvider(() => client);
+        const resolver = new IdentifierResolver(() => client, { appendLine: () => { } } as any);
+        const hoverProvider = new CScoutHoverProvider(resolver, () => false);
         const doc = new MockDocument({ fsPath: 'awk/awk.c' }, 'void checkdup() {}');
         const pos = new MockPosition(0, 5);
         const token = { isCancellationRequested: false, onCancellationRequested: () => ({ dispose: () => { } }) };

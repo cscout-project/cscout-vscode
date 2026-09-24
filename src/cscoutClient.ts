@@ -134,6 +134,51 @@ export interface CScoutIdentifierClassStat {
 	max_len: number | null;
 }
 
+/*
+ * Every identifier token in one file (GET /file/tokens). tokens is a flat
+ * [byteOffset, index, byteOffset, index, ...] list in offset order; index
+ * points into eids and names.
+ */
+export interface CScoutFileTokens {
+	fid: number;
+	eids: number[];
+	names: string[];
+	tokens: number[];
+}
+
+// A function whose whole name is the hovered identifier, with its
+// definition location and metrics (GET /identifier/hover).
+export interface CScoutHoverFunction {
+	ID: number;
+	NAME: string;
+	ISMACRO: number;
+	DEFINED: number;
+	FILESCOPED: number;
+	FANIN: number | null;
+	FANOUT: number | null;
+	CCYCL1: number | null;
+	CCYCL1_PRE: number | null;
+	DEF_FID: number | null;
+	DEF_FOFFSET: number | null;
+	DEF_FILE: string | null;
+	DEF_LNUM: number | null;
+}
+
+// Everything the editor hover shows, fetched by EID alone.
+export interface CScoutHoverData {
+	identifier: CScoutIdentifier;
+	file_count: number;
+	functions: CScoutHoverFunction[];
+}
+
+// A token with a given name on one analyzed line (GET /identifier/candidates).
+export interface CScoutLineCandidate {
+	EID: number;
+	NAME: string;
+	FOFFSET: number;
+	COLUMN: number;
+}
+
 export interface CScoutRefactorPreview {
 	eid: number;
 	old_name: string;
@@ -301,8 +346,21 @@ export class CScoutClient {
 		return this.get<CScoutIdentifier[]>('/identifiers' + this.buildQuery(filters as Record<string, unknown>));
 	}
 
-	async resolveIdentifier(name: string, file: string, line: number): Promise<CScoutIdentifier> {
-		return this.get<CScoutIdentifier>('/identifier/resolve' + this.buildQuery({ name, file, line }));
+	async getFileTokens(fid: number): Promise<CScoutFileTokens> {
+		return this.get<CScoutFileTokens>(`/file/tokens?fid=${fid}`);
+	}
+
+	async getIdentifierHover(eid: number): Promise<CScoutHoverData> {
+		return this.get<CScoutHoverData>(`/identifier/hover?eid=${eid}`);
+	}
+
+	async getIdentifierCandidates(fid: number, line: number, name: string): Promise<CScoutLineCandidate[]> {
+		return this.get<CScoutLineCandidate[]>('/identifier/candidates' + this.buildQuery({ fid, line, name }));
+	}
+
+	/** Identifiers named exactly name (not a substring match), at most limit of them. */
+	async getIdentifiersExact(name: string, limit: number): Promise<CScoutIdentifier[]> {
+		return this.get<CScoutIdentifier[]>('/identifiers/exact' + this.buildQuery({ name, limit }));
 	}
 
 	/**
@@ -346,7 +404,10 @@ export class CScoutClient {
 
 	/**
 	 * Fetch a single function by exact name (defined functions only).
-	 * Used by hover to get CCYCL1 for one function without fetching the whole function list.
+	 * Name alone does not identify a function: static functions with the
+	 * same name in different files all match, and the server returns
+	 * whichever comes first. Use getIdentifierHover() to find the
+	 * function for a known identifier.
 	 */
 	async getFunctionByName(name: string): Promise<CScoutFunction | null> {
 		return this.get<CScoutFunction | null>(`/functions/byname?name=${encodeURIComponent(name)}`);

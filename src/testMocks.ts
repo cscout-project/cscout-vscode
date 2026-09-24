@@ -181,6 +181,8 @@ export const mockVSCode = {
             onDidDispose: () => { }
         }),
         activeTextEditor: undefined,
+        visibleTextEditors: [],
+        onDidChangeActiveTextEditor: () => ({ dispose: () => { } }),
         registerTreeDataProvider: () => ({ dispose: () => { } }),
         createOutputChannel: () => ({
             append: () => { },
@@ -202,6 +204,9 @@ export const mockVSCode = {
         getConfiguration: () => ({
             get: (key: string) => undefined
         }),
+        textDocuments: [],
+        onDidChangeTextDocument: () => ({ dispose: () => { } }),
+        onDidCloseTextDocument: () => ({ dispose: () => { } }),
         openTextDocument: () => Promise.resolve(new MockDocument({ fsPath: 'awk/awk.c' }, 'void checkdup() {}')),
         createFileSystemWatcher: () => {
             activeWatcher = new MockFileSystemWatcher();
