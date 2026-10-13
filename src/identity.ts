@@ -16,42 +16,24 @@
 // along with CScout.  If not, see <http://www.gnu.org/licenses/>.
 
 
-/*
- * Pure logic for mapping an editor position to exactly one CScout
- * identifier (EID). Nothing here talks to VS Code or the server, so it
- * can be unit tested directly; identifierResolver.ts wires it up.
- *
- * CScout's TOKENS table has PRIMARY KEY(FID, FOFFSET): a byte offset in
- * a file belongs to at most one identifier. A TokenMap holds that table
- * for one open document, converted to the document's own (UTF-16)
- * offsets, and keeps it in step with edits so a position can still be
- * looked up exactly after the file changes.
- */
+// A byte offset in a file maps to exactly one identifier (CScout's
+// TOKENS table: PRIMARY KEY(FID, FOFFSET)). This tracks that mapping
+// for one open document and keeps it correct across edits.
 
 import type { CScoutFileTokens, CScoutHoverFunction } from './cscoutClient';
 
-/*
- * What a TokenMap knows about a word in the document:
- *  exact   - the word is exactly the analyzed token(s), unchanged since
- *            analysis; eid/name/start/end describe the token under the
- *            cursor (a word can be several tokens, see lookup()).
- *  none    - the text is unchanged since analysis and CScout recorded no
- *            identifier here (a keyword, a comment, an #if 0 block).
- *  unknown - this text changed since analysis, so the map can't say.
- */
+// none = nothing recorded here (keyword, comment); unknown = this text
+// changed since analysis, so the map can't say.
 export type TokenLookup =
 	| { kind: 'exact'; eid: number; name: string; start: number; end: number }
 	| { kind: 'none' }
 	| { kind: 'unknown' };
 
 export class TokenMap {
-	// Document offset of each token, ascending, and an index into
-	// eids/names for it. Tokens never overlap.
 	private offsets: Int32Array;
 	private index: Int32Array;
 	private count: number;
-	// Text changed since analysis, as [start, end) pairs in ascending
-	// order. An empty range [p, p) marks a deletion point.
+	// An empty range [p, p) marks a deletion point.
 	private dirty: number[] = [];
 	private edited = false;
 
@@ -67,7 +49,6 @@ export class TokenMap {
 		this.count = offsets.length;
 	}
 
-	/* True once the document differs from the analyzed text. */
 	get modified(): boolean {
 		return this.edited;
 	}
@@ -80,7 +61,6 @@ export class TokenMap {
 		return this.names[this.index[i]].length;
 	}
 
-	// First token whose offset is >= offset.
 	private lowerBound(offset: number): number {
 		let lo = 0;
 		let hi = this.count;
@@ -95,11 +75,6 @@ export class TokenMap {
 		return lo;
 	}
 
-	/*
-	 * Mark everything from offset to the end of the document as changed
-	 * and drop the tokens there. Used when the analyzed text stops
-	 * matching partway through a file.
-	 */
 	invalidateFrom(offset: number, documentLength: number): void {
 		let i = this.lowerBound(offset);
 		if (i > 0 && this.offsets[i - 1] + this.lengthAt(i - 1) > offset) {
@@ -110,20 +85,12 @@ export class TokenMap {
 		this.edited = true;
 	}
 
-	/*
-	 * Apply one edit: removed characters at offset were replaced by
-	 * inserted characters. Tokens the edit touches the inside of are
-	 * dropped, tokens after it move by the size difference, and the new
-	 * text is recorded as changed. This mirrors VS Code's own
-	 * contentChanges, so every offset stays exact, not estimated.
-	 */
 	applyChange(offset: number, removed: number, inserted: number): void {
 		const end = offset + removed;
 		const delta = inserted - removed;
 		this.edited = true;
 
 		let i = this.lowerBound(offset);
-		// The one token that can start before the edit and run into it.
 		if (i > 0 && this.offsets[i - 1] + this.lengthAt(i - 1) > offset) {
 			i--;
 		}
@@ -132,7 +99,6 @@ export class TokenMap {
 			const start = this.offsets[read];
 			const overlaps = start < end && start + this.lengthAt(read) > offset;
 			if (overlaps) {
-				// Dropped: the edit is inside this token.
 				continue;
 			}
 			this.offsets[write] = start >= end ? start + delta : start;
@@ -141,7 +107,6 @@ export class TokenMap {
 		}
 		this.count = write;
 
-		// Move changed ranges after the edit; fold touching ones into it.
 		let newStart = offset;
 		let newEnd = offset + inserted;
 		const kept: number[] = [];
@@ -180,24 +145,15 @@ export class TokenMap {
 		return false;
 	}
 
-	/*
-	 * Look up the word [wordStart, wordEnd) with the cursor at cursor.
-	 *
-	 * CScout sometimes splits one written identifier into several
-	 * tokens: when a name like row_numberStepFunc is also produced by
-	 * token pasting (name ## StepFunc) elsewhere, the written word is
-	 * recorded as row_number + StepFunc, each with its own EID. So a
-	 * word only counts as exact if its tokens cover it end to end with
-	 * no gaps; the result is the token the cursor is on.
-	 */
+	// A written word can map to several tokens (macro token-pasting
+	// splits one name into parts with separate EIDs); only a gapless
+	// run counts as exact.
 	lookup(wordStart: number, wordEnd: number, cursor: number): TokenLookup {
 		if (this.touchesDirty(wordStart, wordEnd)) {
 			return { kind: 'unknown' };
 		}
 		let i = this.lowerBound(wordStart);
 		if (i > 0 && this.offsets[i - 1] + this.lengthAt(i - 1) > wordStart) {
-			// A token straddles the start of the word: the word
-			// boundaries don't match the analysis.
 			return { kind: 'unknown' };
 		}
 		if (i >= this.count || this.offsets[i] >= wordEnd) {
@@ -228,7 +184,6 @@ export class TokenMap {
 		};
 	}
 
-	/* Current [start, end) ranges of every token of identifier eid. */
 	rangesOf(eid: number): [number, number][] {
 		const k = this.eids.indexOf(eid);
 		const ranges: [number, number][] = [];
@@ -244,20 +199,6 @@ export class TokenMap {
 	}
 }
 
-/*
- * Build a TokenMap for a document.
- *
- * analyzed: the file's bytes as CScout saw them (read from disk), or
- *           undefined if the file can't be read.
- * current:  the document's text now, which may include unsaved edits.
- *
- * Every token is checked against the analyzed bytes (its name must be
- * at its offset). On an unchanged file this always holds; the first
- * token that fails means the file on disk changed after analysis, so
- * that token and everything after it are treated as unknown. The
- * remaining difference between the file on disk and the editor text is
- * then applied as one edit, so the map matches the editor exactly.
- */
 export function buildTokenMap(
 	data: CScoutFileTokens,
 	analyzed: Buffer | undefined,
@@ -265,7 +206,6 @@ export function buildTokenMap(
 ): TokenMap {
 	const bytes = analyzed ?? Buffer.from(current, 'utf8');
 	const text = analyzed ? bytes.toString('utf8') : current;
-	// Every character is one byte, so byte offsets are text offsets.
 	const oneToOne = text.length === bytes.length;
 
 	const nameBytes = data.names.map((n) => Buffer.from(n, 'utf8'));
@@ -315,11 +255,6 @@ export function buildTokenMap(
 	return map;
 }
 
-/*
- * The single edit that turns before into after: the common prefix and
- * suffix are kept, the middle is replaced. Returns [offset, removed,
- * inserted] in the same form as applyChange.
- */
 export function diffRange(before: string, after: string): [number, number, number] {
 	const max = Math.min(before.length, after.length);
 	let prefix = 0;
@@ -336,12 +271,6 @@ export function diffRange(before: string, after: string): [number, number, numbe
 	return [prefix, before.length - prefix - suffix, after.length - prefix - suffix];
 }
 
-/*
- * When the text changed, the server can still list the tokens with this
- * name on the same line (as analyzed). One distinct identifier there is
- * the answer; several can only be told apart by their byte column, and
- * if none sits at the cursor's column there is no answer.
- */
 export function chooseLineCandidate(
 	candidates: { EID: number; COLUMN: number }[],
 	byteColumn: number
@@ -357,17 +286,9 @@ export function chooseLineCandidate(
 	return undefined;
 }
 
-/*
- * Which function a hovered identifier names.
- *  one       - a single definition. CScout can record the same function
- *              once per project; those rows share the definition and
- *              its metrics, and the one with the most callers is used.
- *  ambiguous - several different definitions (unrelated same-named
- *              functions in separate programs) and none, or more than
- *              one, in the current file.
- *  none      - no defined function has exactly this identifier as its
- *              name (declared only, or only part of a pasted name).
- */
+// CScout can record the same function once per project; those count as
+// one definition. "ambiguous" means unrelated same-named functions in
+// separate programs.
 export type FunctionPick =
 	| { kind: 'one'; fn: CScoutHoverFunction }
 	| { kind: 'ambiguous'; definitions: CScoutHoverFunction[] }

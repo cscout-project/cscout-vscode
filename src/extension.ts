@@ -860,7 +860,6 @@ async function delayUntilCancelled(ms: number, token: vscode.CancellationToken):
     });
 }
 
-// Says why a hover is a best match rather than a confirmed one.
 function fallbackNote(res: Extract<Resolution, { kind: 'uncertain' }>): string {
     const how = res.via === 'unique-name'
         ? 'it is the only identifier with this name'
@@ -875,7 +874,6 @@ function fallbackNote(res: Extract<Resolution, { kind: 'uncertain' }>): string {
     return `$(warning) **Possibly a different identifier:** matched because ${how}, since ${why}. Re-analyze to be sure.`;
 }
 
-// The message shown when rename is refused because the match isn't exact.
 function renameRefusal(res: Resolution): string {
     return res.kind === 'uncertain' && res.why !== 'edited'
         ? `CScout can't rename '${res.name}' safely: it can't confirm which identifier this is. Re-analyze first.`
@@ -888,15 +886,6 @@ export class CScoutHoverProvider implements vscode.HoverProvider {
         private isAnalysisStale: () => boolean
     ) { }
 
-    /**
-     * Hover for a C identifier.
-     *
-     * The resolver matches the position to exactly one identifier (EID),
-     * and everything shown is fetched by that EID in a single request,
-     * cached per EID. Nothing is looked up by name after the match.
-     * Waits 150ms first so sweeping the mouse across the code doesn't
-     * fetch data for every word it crosses.
-     */
     async provideHover(
         document: vscode.TextDocument,
         position: vscode.Position,
@@ -942,12 +931,11 @@ export class CScoutHoverProvider implements vscode.HoverProvider {
             md.appendMarkdown(`**Defined in ${pick.definitions.length} places**, so no single complexity applies  \n`);
         }
 
-        const crossesFileBoundary = data.file_count > 1;
-        if (crossesFileBoundary) {
+        if (data.file_count > 1) {
             md.appendMarkdown(`**Crosses file boundaries** (${data.file_count} files)  \n`);
         }
 
-        if (id.LSCOPE && !id.CSCOPE && !id.READONLY && !id.UNUSED && !crossesFileBoundary && id.NAME !== 'main') {
+        if (data.should_be_static) {
             md.appendMarkdown(`\n💡 **Should be static** - only accessed within a single file  \n`);
         }
 
@@ -993,9 +981,6 @@ class CScoutDefinitionProvider implements vscode.DefinitionProvider {
             const res = await this.resolver.resolve(document, position, token);
             if (!res || res.kind === 'unmatched' || token.isCancellationRequested) return;
 
-            // For functions, the definition of the function whose whole
-            // name is this identifier; several if there are unrelated
-            // same-named definitions and none is in this file.
             const data = await this.resolver.getHoverData(res.eid);
             if (token.isCancellationRequested) return;
             if (data.identifier.FUN) {
@@ -1009,15 +994,9 @@ class CScoutDefinitionProvider implements vscode.DefinitionProvider {
                     ));
                 if (locations.length > 0) return locations;
             }
-            // Other identifiers: the first location in a writable file.
             // Ask for up to 999999 locations so the real definition doesn't get cut off
             // if it's far down the list. Not real pagination, just a limit big enough
             // to cover every project we've seen.
-            //
-            // TODO: this needs a real fix later: either getIdentifier gets
-            // real paging instead of one big number, or the server tells us
-            // straight up how many locations there are instead of us
-            // guessing a limit that's "big enough."
             const detail = await client.getIdentifier(res.eid, 999999);
             if (token.isCancellationRequested) return;
             const located = detail.locations.filter((l) => l.LNUM !== null);
@@ -1140,9 +1119,6 @@ class CScoutRenameProvider implements vscode.RenameProvider {
                     continue;
                 }
 
-                // No map: use the analyzed offset, but only where the text
-                // there is still the old name. Anything else is skipped
-                // and reported rather than guessed.
                 let doc: vscode.TextDocument;
                 try {
                     doc = openDoc ?? await vscode.workspace.openTextDocument(uri);
@@ -1430,7 +1406,6 @@ export function activate(context: vscode.ExtensionContext): void {
     const lifecycle = new CScoutLifecycle(settings, channel, {
         onStateChange: (state, detail) => {
             currentState = state;
-            // Any transition means a different analysis, or none.
             resolver.reset();
             void vscode.commands.executeCommand('setContext', stateContextKey, state);
             if (state !== 'ready') {
@@ -1454,8 +1429,6 @@ export function activate(context: vscode.ExtensionContext): void {
                 if (client) {
                     void refreshDiagnostics(client, diagnostics);
                 }
-                // Load token positions for the files already on screen, so
-                // the first hover doesn't wait for them.
                 for (const editor of vscode.window.visibleTextEditors) {
                     resolver.prefetch(editor.document);
                 }
@@ -2086,9 +2059,7 @@ async function showCallGraph(
         fnid = eidOrFnid;
         fnName = nameHint ?? `function ${fnid}`;
     } else {
-        // Called with an EID: find the function whose whole name is this
-        // identifier. If unrelated same-named functions are defined in
-        // several places, ask which one.
+        // Called with an EID: find the function it names.
         const data = await client.getIdentifierHover(eidOrFnid);
         fnName = data.identifier.NAME;
         const pick = pickFunction(data.functions, undefined);

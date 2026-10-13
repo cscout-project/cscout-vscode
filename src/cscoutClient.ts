@@ -146,8 +146,8 @@ export interface CScoutFileTokens {
 	tokens: number[];
 }
 
-// A function whose whole name is the hovered identifier, with its
-// definition location and metrics (GET /identifier/hover).
+// A function whose whole name is the hovered identifier (not a partial
+// match from token pasting).
 export interface CScoutHoverFunction {
 	ID: number;
 	NAME: string;
@@ -164,14 +164,16 @@ export interface CScoutHoverFunction {
 	DEF_LNUM: number | null;
 }
 
-// Everything the editor hover shows, fetched by EID alone.
 export interface CScoutHoverData {
 	identifier: CScoutIdentifier;
 	file_count: number;
+	// CScout's should_be_static rule, evaluated server-side for this one
+	// identifier - the same rule used by the sidebar and diagnostics, not
+	// a separate copy of it.
+	should_be_static: boolean;
 	functions: CScoutHoverFunction[];
 }
 
-// A token with a given name on one analyzed line (GET /identifier/candidates).
 export interface CScoutLineCandidate {
 	EID: number;
 	NAME: string;
@@ -212,9 +214,6 @@ export interface CScoutIdentifierDetail {
 		metrics: CScoutFuncMetric[];
 	} | null;
 }
-
-// TODO: check if dead code.
-export type CScoutIdDetail = CScoutIdentifierDetail;
 
 export interface CScoutRefactorApplyResult {
 	old_name: string;
