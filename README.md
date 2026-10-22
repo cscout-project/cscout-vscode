@@ -4,6 +4,8 @@
 
 This extension puts that analysis inside VS Code itself. Instead of switching windows to look something up, you hover over a variable and see its type, scope, and complexity right there. Go to Definition and Find All References use CScout's analysis. Renaming a variable with F2 follows it correctly through macros and across files, something a plain text-based rename can't do safely in C.
 
+The extension will be published to VS Code Marketplace.
+
 ## What it does
 
 - Hover, go to definition, and find references
