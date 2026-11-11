@@ -340,7 +340,7 @@ export async function checkDependency(command: string, friendlyMessage: string, 
 		if (command.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(command)) {
 			// Absolute path: check if it exists using standard fs
 			const fs = require('fs');
-			if (!fs.existsSync(command)) {
+			if (!fs.existsSync(command) && !fs.existsSync(`${command}.exe`)) {
 				throw new Error();
 			}
 			return;

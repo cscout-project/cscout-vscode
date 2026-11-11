@@ -211,12 +211,13 @@
         },
         "cscout.cscocoPyPath": {
           "type": "string",
-          "default": "cscoco.py",
-          "description": "Required. Path to cscoco.py, which converts compile_commands.json into a CScout workspace file."
+          "default": "",
+          "description": "Optional override. Path to cscoco.py. If left blank, directly derived from the CScout binary path."
         },
         "cscout.csapiPyPath": {
           "type": "string",
-          "description": "Required. Path to csapi.py, the REST server the extension talks to. If left blank, assumed to be next to cscocoPyPath."
+          "default": "",
+          "description": "Optional override. Path to csapi.py. If left blank, directly derived from the CScout binary path."
         },
         "cscout.pythonPath": {
           "type": "string",
@@ -240,8 +241,8 @@
         },
         "cscout.csmakePath": {
           "type": "string",
-          "default": "csmake",
-          "description": "Optional. Only needed if your project uses a plain Makefile (not CMake/Meson). Path to the csmake tool."
+          "default": "",
+          "description": "Optional override. Path to the csmake tool. If left blank, directly derived from the CScout binary path."
         },
         "cscout.projectName": {
           "type": "string",

@@ -33,7 +33,7 @@ import {
 } from './cscoutClient';
 import { CScoutLifecycle, CScoutState } from './lifecycle';
 import { CScoutSettings } from './buildSystem';
-import { toEditorPath, toCScoutPath, checkDependency, commandRunsInWsl } from './platform';
+import { toEditorPath, toCScoutPath, checkDependency, commandRunsInWsl, resolveScriptPath } from './platform';
 
 // TODO: this file has grown big, it would be worth pulling pieces out into
 // their own files, something like treeProviders.ts, editorProviders.ts,
@@ -84,26 +84,35 @@ function friendlyErrorMessage(err: unknown): string {
 // Settings helpers
 // -----------------------------------------------------------------------
 
+function deriveToolFromBinary(binaryPath: string, toolName: string): string {
+    if (binaryPath && (binaryPath.includes('/') || binaryPath.includes('\\'))) {
+        const separator = binaryPath.includes('/') ? '/' : '\\';
+        const lastIdx = binaryPath.lastIndexOf(separator);
+        if (lastIdx !== -1) {
+            const dir = binaryPath.substring(0, lastIdx);
+            return `${dir}${separator}${toolName}`;
+        }
+    }
+    return toolName;
+}
+
 function loadSettings(): CScoutSettings {
     const cfg = vscode.workspace.getConfiguration('cscout');
-    const cscocoPy = cfg.get<string>('cscocoPyPath', 'cscoco.py');
-    // If csapiPyPath isn't set explicitly, derive it from cscocoPyPath by
-    // swapping the filename. That way someone who only configures cscoco.py's
-    // path doesn't also have to set csapi.py's path separately when the two
-    // scripts live side by side, which is the normal install layout.
-    const csapiPy =
-        cfg.get<string>('csapiPyPath') ||
-        (cscocoPy && cscocoPy.endsWith('cscoco.py')
-            ? cscocoPy.replace(/cscoco\.py$/, 'csapi.py')
-            : 'csapi.py');
+    const cscoutBinary = cfg.get<string>('binaryPath', 'cscout');
+
+    // csapi, cscoco, and csmake are directly derived from the CScout binary path,
+    // with settings acting as optional overrides.
+    const cscocoPy = cfg.get<string>('cscocoPyPath') || deriveToolFromBinary(cscoutBinary, 'cscoco.py');
+    const csapiPy = cfg.get<string>('csapiPyPath') || deriveToolFromBinary(cscoutBinary, 'csapi.py');
+    const csmake = cfg.get<string>('csmakePath') || deriveToolFromBinary(cscoutBinary, 'csmake');
 
     return {
         host: cfg.get<string>('host', 'localhost'),
         port: cfg.get<number>('port', 0),
-        cscoutBinaryPath: cfg.get<string>('binaryPath', 'cscout'),
+        cscoutBinaryPath: cscoutBinary,
         cscocoPyPath: cscocoPy,
         csapiPyPath: csapiPy,
-        csmakePath: cfg.get<string>('csmakePath', 'csmake'),
+        csmakePath: csmake,
         pythonPath: cfg.get<string>('pythonPath', 'python3'),
         sqlite3Path: cfg.get<string>('sqlite3Path', 'sqlite3'),
         autoStart: cfg.get<boolean>('autoStart', false),
@@ -1817,17 +1826,22 @@ export function activate(context: vscode.ExtensionContext): void {
         vscode.commands.registerCommand('cscout.verifySetup', async () => {
             const settings = vscode.workspace.getConfiguration('cscout');
             const binaryPath = settings.get<string>('binaryPath', 'cscout');
-            const cscocoPyPath = settings.get<string>('cscocoPyPath', 'cscoco.py');
-            const csapiPyPath = settings.get<string>('csapiPyPath', '');
-            const csmakePath = settings.get<string>('csmakePath', 'csmake');
-            const pythonPath = settings.get<string>('pythonPath', 'python3');
+            const cscocoSetting = settings.get<string>('cscocoPyPath', '');
+            const csapiSetting = settings.get<string>('csapiPyPath', '');
+            const csmakeSetting = settings.get<string>('csmakePath', '');
+
+            const inWsl = commandRunsInWsl(binaryPath);
+
+            // Directly derive csapi, cscoco, and csmake from the CScout binary path
+            const derivedCscoco = await resolveScriptPath(cscocoSetting || 'cscoco.py', binaryPath, inWsl);
+            const derivedCsapi = await resolveScriptPath(csapiSetting || 'csapi.py', binaryPath, inWsl);
+            const derivedCsmake = await resolveScriptPath(csmakeSetting || 'csmake', binaryPath, inWsl);
 
             const checks: { name: string; path: string }[] = [
                 { name: 'CScout binary', path: binaryPath },
-                { name: 'cscoco.py', path: cscocoPyPath },
-                { name: 'csapi.py', path: csapiPyPath },
-                { name: 'csmake', path: csmakePath },
-                { name: 'Python', path: pythonPath },
+                { name: 'cscoco.py', path: derivedCscoco },
+                { name: 'csapi.py', path: derivedCsapi },
+                { name: 'csmake', path: derivedCsmake },
             ];
 
             const results: string[] = [];
@@ -2982,10 +2996,9 @@ th { color: var(--vscode-descriptionForeground); font-size: .9em; }
 <h2>Set Up Extension Settings</h2>
 <p>Tell the extension where to find the CScout tools:</p>
 <pre><code># In VS Code settings (cscout.*):
-cscout.binaryPath     - path to the CScout binary
-cscout.cscocoPyPath   - path to cscoco.py (for CMake/Meson projects)
-cscout.csapiPyPath    - path to csapi.py (REST server)
-cscout.csmakePath     - path to csmake (for Makefile projects)</code></pre>
+cscout.binaryPath     - path to the CScout binary (csapi, cscoco, and csmake are directly derived from this path)
+cscout.pythonPath     - path to your Python 3 interpreter
+cscout.sqlite3Path    - path to the sqlite3 command-line tool</code></pre>
 <button onclick="openSettings()">Open CScout Settings</button>
 </div>
 
