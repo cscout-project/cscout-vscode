@@ -5,7 +5,7 @@ import * as fs from 'fs';
 
 // Now import target files
 import { CScoutClient } from './cscoutClient';
-import { toWslPath, fromWslPath } from './platform';
+import { toWslPath, fromWslPath, resolveScriptPath } from './platform';
 import { detectAll } from './buildSystem';
 import { CScoutLifecycle } from './lifecycle';
 import {
@@ -45,6 +45,17 @@ async function runTests() {
     await test('fromWslPath translates WSL paths', async () => {
         const win = fromWslPath('/mnt/c/Users/foo/project');
         assert(win === 'C:\\Users\\foo\\project', `Expected C:\\Users\\foo\\project, got ${win}`);
+    });
+
+    await test('resolveScriptPath derives sibling tools directly from cscout binary path', async () => {
+        const csapi = await resolveScriptPath('csapi.py', '/usr/local/bin/cscout', false);
+        assert(csapi === '/usr/local/bin/csapi.py', `Expected /usr/local/bin/csapi.py, got ${csapi}`);
+
+        const cscoco = await resolveScriptPath('cscoco.py', '/usr/local/bin/cscout', false);
+        assert(cscoco === '/usr/local/bin/cscoco.py', `Expected /usr/local/bin/cscoco.py, got ${cscoco}`);
+
+        const csmake = await resolveScriptPath('csmake', '/usr/local/bin/cscout', false);
+        assert(csmake === '/usr/local/bin/csmake', `Expected /usr/local/bin/csmake, got ${csmake}`);
     });
 
     // --- Build System Detection Tests ---

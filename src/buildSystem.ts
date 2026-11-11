@@ -378,6 +378,7 @@ export async function generateCsFile(
 	progress?.report({ message: 'Preparing compilation database...' });
 
 	let compileCommandsPath: string | undefined;
+	const inWsl = commandRunsInWsl(settings.cscoutBinaryPath);
 
 	switch (answer.choice) {
 		case 'compile-commands':
@@ -417,8 +418,9 @@ export async function generateCsFile(
 
 		case 'makefile':
 			channel.appendLine('--- Running csmake ---');
-			await checkDependency(settings.csmakePath, 'csmake not found. Please ensure CScout is properly installed and csmake is in your PATH.', commandRunsInWsl(settings.csmakePath));
-			await spawnStreaming(settings.csmakePath, [], workspaceRoot, channel);
+			const resolvedCsmake = await resolveScriptPath(settings.csmakePath, settings.cscoutBinaryPath, inWsl);
+			await checkDependency(resolvedCsmake, 'csmake not found. Please ensure CScout is properly installed and csmake is in your PATH.', inWsl);
+			await spawnStreaming(resolvedCsmake, [], workspaceRoot, channel);
 			// csmake writes make.cs - rename it to <projectName>.cs.
 			try {
 				fs.renameSync(path.join(workspaceRoot, 'make.cs'), csFilePath);
@@ -447,7 +449,8 @@ export async function generateCsFile(
 			}
 			await spawnStreaming('sh', ['configure'], workspaceRoot, channel);
 			channel.appendLine('--- Running csmake ---');
-			await spawnStreaming(settings.csmakePath, [], workspaceRoot, channel);
+			const resolvedAutotoolsCsmake = await resolveScriptPath(settings.csmakePath, settings.cscoutBinaryPath, inWsl);
+			await spawnStreaming(resolvedAutotoolsCsmake, [], workspaceRoot, channel);
 			try {
 				fs.renameSync(path.join(workspaceRoot, 'make.cs'), csFilePath);
 			} catch {
@@ -476,10 +479,10 @@ export async function generateCsFile(
 	progress?.report({ message: 'Generating workspace file with cscoco...' });
 	channel.appendLine('--- Running cscoco ---');
 
-	const inWsl = commandRunsInWsl(settings.pythonPath);
-	const resolvedCscoco = await resolveScriptPath(settings.cscocoPyPath, settings.cscoutBinaryPath, inWsl);
-	const cscocoArg = pathForCommand(resolvedCscoco, inWsl);
-	const ccArg = pathForCommand(compileCommandsPath, inWsl);
+	const pythonInWsl = commandRunsInWsl(settings.pythonPath);
+	const resolvedCscoco = await resolveScriptPath(settings.cscocoPyPath, settings.cscoutBinaryPath, pythonInWsl);
+	const cscocoArg = pathForCommand(resolvedCscoco, pythonInWsl);
+	const ccArg = pathForCommand(compileCommandsPath, pythonInWsl);
 
 	const cscocoOutput = await spawnStreaming(
 		settings.pythonPath,
